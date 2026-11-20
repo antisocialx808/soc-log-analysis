@@ -1,32 +1,60 @@
-# Incident Report 001: Brute Force and Reconnaissance Activity
+# Incident Report 001: SSH Brute Force and Web Reconnaissance
 
 **Practice report on public sample logs from secrepo.com. Not an incident at an employer.**
 
 | | |
 |---|---|
-| **Log source** | secrepo.com, a security research site that publishes server logs for educational use |
-| **Date of analysis** | June 30, 2026 |
-| **Severity** | High (unresolved internal source of SSH attempts) |
-| **Status** | Findings open. The internal host cannot be resolved from this dataset |
+| **Data** | Three public log files from secrepo.com: an SSH log (Zeek format, timestamps from March 2012), an Apache access log (8 to 9 May 2026) and an Apache error log (30 May 2026) |
+| **Date of analysis** | June 30, 2026. Revised with a script, November 2026 |
+| **Status** | Practice exercise. Findings open |
 | **Prepared by** | Samuel, practice report |
+
+The three logs cover different dates, so this report treats them as separate datasets. It does not claim the SSH activity and the web activity are connected.
 
 ## At a glance
 
-- 48% of failed SSH logins came from one internal address, 192.168.229.101. The pattern fits automated brute force, but the logs alone can't say whether that host is compromised or a misconfigured scanner.
-- Web activity was reconnaissance only. No PHP probe returned a 200, and ModSecurity blocked a request for /dump.sql.
-- Three of the top five access-log IPs were archiving bots, not attackers. The bigger issue they exposed is a publicly readable log directory.
+- **SSH:** 71% of 7,143 connections failed. One internal address, 192.168.202.141, caused 2,365 of the 5,069 failures (46.7%) and never logged a success. The pattern fits an automated brute force.
+- **The better lead:** 192.168.204.45 and 192.168.202.110 each logged hundreds of failures and then successful logins. That is the pattern that suggests a guessed credential.
+- **Web:** scanning for .php files returned no 200s. Three of the top five IPs were archiving bots downloading the server's public log directory.
 
-## 1. Summary
+## 1. SSH log analysis
 
-SSH brute force activity was detected: 2,444 of 5,069 failed authentication attempts (48%) came from internal host 192.168.229.101. There were 7,143 total connection attempts, with a 4.2% success rate. An internal source needs verification. It could be a compromised host or a misconfigured internal scanning tool, and this is not yet confirmed.
+7,143 connections between 2012-03-16 12:30 and 2012-03-17 20:56 UTC.
 
-Web reconnaissance was logged against the application server at the same time: automated scanning, PHP file probing consistent with WordPress fingerprinting, and a direct request for an exposed database backup file (dump.sql). ModSecurity blocked the dump.sql request and flagged two external IPs for repeated rule violations. There is no evidence of successful data exfiltration.
+| Outcome | Count | Share |
+|---|---|---|
+| Failure | 5,069 | 71.0% |
+| Success | 301 | 4.2% |
+| Undetermined | 1,773 | 24.8% |
 
-## 2. Evidence
+**Top failure sources**
 
-**SSH log:** 7,143 total connections. 301 succeeded, 5,069 failed, 1,773 undetermined. Top source: 192.168.229.101 (2,444 attempts, internal address).
+| Source IP | Failures | Share of all failures | Total attempts |
+|---|---|---|---|
+| 192.168.202.141 | 2,365 | 46.7% | 2,380 |
+| 192.168.202.110 | 613 | 12.1% | 986 |
+| 192.168.204.45 | 574 | 11.3% | 839 |
+| 192.168.202.140 | 433 | 8.5% | 894 |
+| 192.168.202.68 | 161 | 3.2% | 176 |
 
-**Access log, status code distribution:**
+**Failures before a first success.** 15 source IPs logged at least one failure before their first success. The largest:
+
+| Source IP | Failures before first success | Total successes |
+|---|---|---|
+| 192.168.204.45 | 208 | 2 |
+| 192.168.202.110 | 164 | 6 |
+| 192.168.203.45 | 85 | 18 |
+| 192.168.202.108 | 59 | 4 |
+
+**Analysis.** The failure volume does not look like people mistyping passwords. 192.168.202.141 produced 2,365 failures and no successful login. The remaining 15 of its 2,380 connections are undetermined. It looks like an unsuccessful automated attack, or a misconfigured scanner.
+
+192.168.204.45 and 192.168.202.110 matter more. Hundreds of failures followed by a success is what a working brute force or credential-guessing run looks like. This log can't show whether those logins were legitimate users who forgot a password or an attacker who got in. They need follow-up.
+
+All source addresses are internal, so each could be a compromised host or an internal scanning tool. The log alone can't confirm which. Zeek records one row per connection, and a single connection can contain several password attempts, so the true number of guesses is likely higher than the failure counts.
+
+## 2. Web log analysis
+
+20,145 requests between 8 May 2026 01:06 and 9 May 2026 00:51 (UTC-7).
 
 | Status | Count |
 |---|---|
@@ -36,55 +64,54 @@ Web reconnaissance was logged against the application server at the same time: a
 | 404 | 135 |
 | 304 | 3 |
 
-125 requests targeted .php files outside the known application stack, including wp-trackback.php, /z.php, /x.php and /yellow.php. All PHP probe requests returned 301, 404 or 429. No 200 responses were recorded.
-
-**Error log:** ModSecurity blocked a request for /dump.sql. Two external IPs were flagged: 42.193.171.36 (4 hits) and 91.219.237.39 (2 hits).
-
-## 3. Analysis
-
-**SSH.** The failure volume and rate don't match manual login behaviour and fit an automated brute force pattern. The concentration of attempts from a single internal address is the finding that needs follow-up. It could mean an internal host is compromised and being used as a launch point, or it could be a misconfigured internal scanning tool. This log set alone can't confirm which.
-
-Undetermined sessions are connections that opened without a clean success or fail outcome, typically a dropped connection or a timeout mid-handshake. They don't change the overall picture but should be accounted for in escalation.
-
-**Web layer.** The activity reads as reconnaissance, not exploitation. The 429 volume shows the server's rate limiting engaged against an automated client. The PHP probing used non-standard filenames plus a WordPress-specific path on a server that may not run WordPress. That looks like a fingerprinting pass to map the application stack and find a known vulnerability set. None of the probes returned a 200, so none of the probed files were confirmed to exist on the server. The scanner was working blind.
-
-**dump.sql.** This is the most serious web-layer finding. It is a known low-effort probe that attackers run routinely, checking for database backup files accidentally left in public web directories. A successful response would have returned full database contents, which could include credentials, personal data and transaction records. If the server held personal data of Nigerian residents, that would likely be a reportable breach under the Nigeria Data Protection Act 2023. ModSecurity blocked it.
-
-## 4. IP Classification: Access Log
+**IP classification**
 
 | IP | Requests | Classification | Basis |
 |---|---|---|---|
-| 74.7.243.240 | 8,904 | Archiving bot | Sequential log downloads, 8,318 × 200 |
+| 74.7.243.240 | 8,904 | Archiving bot | Sequential log downloads, 8,318 × 200, 578 × 429 |
 | 1.162.11.44 | 6,360 | Archiving bot | Sequential log downloads, 6,360 × 200 |
-| 79.101.171.152 | 3,403 | Archiving bot | robots.txt check, Apache sort links, log downloads |
-| 4.228.101.41 | 106 | Malicious scanner | WordPress/PHP probing, 53 × 429, 53 × 301, zero 200s |
-| 107.136.138.10 | 48 | Clean | Favicon and apple-touch-icon requests only |
+| 79.101.171.152 | 3,403 | Archiving bot | robots.txt check, Apache sort links, log downloads, 3,345 × 200 |
+| 4.228.101.41 | 106 | Malicious scanner | WordPress and PHP probing, 53 × 429, 53 × 301, zero 200s |
+| 107.136.138.10 | 48 | Benign | Favicon, apple-touch-icon and one directory listing, each requested 12 times |
 
-## 5. Impact Assessment
+**PHP probing.** 115 requests targeted 59 distinct .php paths, including wp-trackback.php, xmlrpc.php, z.php, x.php and yellow.php. Results: 56 × 301, 55 × 429, 4 × 404. None returned a 200. The mix of non-standard filenames and WordPress-specific paths is a fingerprinting pass to map the stack. The 429s show rate limiting engaged against an automated client.
 
-No confirmed compromise.
+## 3. Error log analysis
 
-**Web layer:** rate limiting returned 429s to the scanner, no PHP probe returned a 200, and ModSecurity blocked the dump.sql request.
+The error log has three ModSecurity lines, all at Warning level.
 
-**SSH:** this report has not yet checked whether any of the 301 successful sessions followed repeated failures from the same IP, or came from 192.168.229.101. Until that check is done, SSH authentication controls can't be called effective.
+| Source IP | Lines | Rule message | URI |
+|---|---|---|---|
+| 42.193.171.36 | 2 | Request content type is not allowed by policy | / |
+| 91.219.237.39 | 1 | URL file extension is restricted by policy | /dump.sql |
 
-**Open item:** the status of 192.168.229.101, compromised host or misconfigured internal tool, is unresolved and must be escalated before this incident can be closed.
+The /dump.sql request is a known low-effort probe, checking for database backup files left in public web directories. If a backup existed and was served, it could expose credentials and personal data. A Warning means the rule matched and was logged. These lines don't show whether the request was refused, and the access log covers a different day, so I can't check the response code. This is worth confirming (see recommendations).
 
-## 6. Configuration Risk: Exposed Log Directory
+## 4. Configuration risk: exposed log directory
 
-Investigation of the top five source IPs showed that three of them (74.7.243.240, 1.162.11.44 and 79.101.171.152) were not threat actors. They were archiving bots systematically downloading the server's publicly accessible /self.logs/ directory. Combined, the three made 18,667 requests. The first two alone account for 14,678 successful (200) responses.
+The three archiving bots were downloading the server's public /self.logs/ directory. Together they received 18,023 successful responses, and 18,517 of their 18,667 requests targeted that directory.
 
-The root exposure is not the bots. It is that months of server logs are publicly readable. Anyone downloading this archive learns what attack patterns the server has seen, how far ModSecurity rule coverage reaches, internal path structures and recurring visitor IPs. On a production server this would be a serious misconfiguration.
+The exposure is not the bots. It is that the server's logs are publicly readable. Anyone downloading them learns what attacks the server has seen, how far ModSecurity coverage reaches, internal paths and recurring visitor IPs. On a production server this would be a serious misconfiguration. Here it is intentional, since the site exists to share logs.
 
-## 7. Recommendations
+## 5. Impact assessment
 
-1. Isolate and inspect 192.168.229.101 to confirm whether it is a compromised host or a misconfigured internal scanner. This is the priority action before closing this report.
-2. For every IP in the SSH log, check for failed attempts followed by a success. Report any match.
-3. Confirm dump.sql and any other backup files are not present in the web root on this or any other server in the environment.
-4. Review WAF and ModSecurity rule coverage for the PHP probe patterns observed, and confirm 42.193.171.36 and 91.219.237.39 are blocklisted.
-5. Review the SSH authentication method. If internet-facing, disable password login and move to key-based authentication.
-6. Restrict access to any log directories via .htaccess or server configuration, and confirm no equivalent exposure exists across the organisation's web infrastructure.
+No confirmed compromise in the web data. In the SSH data, successful logins after repeated failures are unexplained and need investigation before any all-clear.
 
-**Escalation required:** Yes, internal host investigation pending.
+## 6. Recommendations
 
-*Practice exercise on public sample logs. Not a live production incident.*
+1. Investigate the successful logins from 192.168.204.45 and 192.168.202.110. Check what each session did and whether the user and device are known.
+2. Identify the host behind 192.168.202.141, then block it or fix it, depending on whether it is a scanner or a compromised machine.
+3. If SSH is reachable from untrusted networks, disable password login and use key-based authentication. Add rate limiting or a tool like fail2ban.
+4. Confirm that dump.sql and any other backup files are absent from the web root, and check whether ModSecurity is blocking or only detecting. The logs show warnings.
+5. Review the PHP probe patterns against current rule coverage, and consider blocking 4.228.101.41, 42.193.171.36 and 91.219.237.39 after review.
+6. Restrict access to log directories unless the exposure is intended.
+
+**Escalation required:** Yes, for the SSH items above.
+
+## Method and limits
+
+Counts come from `scripts/parse_logs.py` in this repository, run on the three files named above. The script, the files and the date they were downloaded are listed in the README.
+
+- The SSH log is from 2012 and the web logs are from 2026. Treat them as separate exercises.
+- "Undetermined" is Zeek's label for connections where it couldn't tell whether authentication succeeded. I don't interpret them further.
+- Classifying an IP as a bot or scanner is a judgement from its behaviour in this log, not from threat intelligence.
